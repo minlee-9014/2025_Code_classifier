@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RO 엑셀 가공기 (HTML+JS, 작업명+작업코드)</title>
+    <!-- SheetJS xlsx 라이브러리 (클라이언트 사이드) CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 30px;
+      }
+      h1 {
+        margin-bottom: 20px;
+      }
+      .file-input {
+        margin-bottom: 10px;
+      }
+      button {
+        padding: 8px 16px;
+        font-size: 16px;
+      }
+      #status {
+        margin-top: 20px;
+        color: green;
+      }
+    </style>
+</head>
+<body>
+    <h1>RO 엑셀 가공기 (차체팀, 331)</h1>
+
+    <div class="file-input">
+        <label>① “최종 RO.xlsx” 파일 업로드 (시트명: 단순정리본): 
+            <input type="file" id="fileDongbu" accept=".xlsx" />
+        </label>
+    </div>
+    <div class="file-input">
+        <label>② “차체 지정 RO.xlsx” 파일 업로드 (시트명: 차체 지정 RO): 
+            <input type="file" id="fileMap" accept=".xlsx" />
+        </label>
+    </div>
+    <button id="btnProcess">가공 시작</button>
+
+    <div id="status"></div>
+
+    <script>
+    (function() {
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // 요약:
+      // 1) 두 파일을 업로드 → ArrayBuffer로 읽음
+      // 2) SheetJS(XLSX)로 “단순정리본” 시트와 “차체 지정 RO” 시트 파싱
+      // 3) 행 필터링: “작업자 팀” == '331'
+      // 4) 필터링 결과 중 “작업코드”가 매핑 파일의 “행 레이블” 목록에 속하지 않으면 제외
+      // 5) “RO분류” 시트 AOA, “엔지니어 사번” 시트 AOA 생성
+      // 6) 매핑 파일 순서대로 “작업명”과 “작업코드”를 1행/2행에 넣고, 엔지니어별 카운트 집계 → “Matrix A(JS)” 시트 AOA 생성
+      // 7) 새 워크북에 3개 시트를 붙여서 자동 다운로드
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+      const fileDongbuInput = document.getElementById('fileDongbu');
+      const fileMapInput    = document.getElementById('fileMap');
+      const btnProcess      = document.getElementById('btnProcess');
+      const statusDiv       = document.getElementById('status');
+
+      // 파일 입력에서 첫 번째 File 객체를 반환
+      function getSelectedFile(inputElem) {
+        if (!inputElem.files || inputElem.files.length === 0) {
+          return null;
+        }
+        return inputElem.files[0];
+      }
+
+      // File → ArrayBuffer로 읽는 Promise 래퍼
+      function readFileAsArrayBuffer(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = e => resolve(e.target.result);
+          reader.onerror = e => reject(e);
+          reader.readAsArrayBuffer(file);
+        });
+      }
+
+      // 중복 제거용 헬퍼
+      function uniqueArray(arr) {
+        return Array.from(new Set(arr));
+      }
+
+      // Workbook에서 특정 시트를 JSON 배열(Object)로 반환
+      function sheetToJson(wb, sheetName) {
+        const ws = wb.Sheets[sheetName];
+        if (!ws) {
+          throw new Error(`시트 "${sheetName}"을(를) 찾을 수 없습니다.`);
+        }
+        return XLSX.utils.sheet_to_json(ws, { defval: '' });
+      }
+
+      // Array of Arrays(2차원 배열) → Sheet 변환
+      function aoaToSheet(aoa) {
+        return XLSX.utils.aoa_to_sheet(aoa);
+      }
+
+      // Workbook을 바이너리로 만들어 브라우저에서 다운로드
+      function downloadWorkbook(wb, filename) {
+        const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        const blob = new Blob([wbout], { type: 'application/octet-stream' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href     = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          document.body.removeChild(a);
+          window.URL.revokeObjectURL(url);
+        }, 100);
+      }
+
+      // 메인 처리 함수
+      async function processFiles() {
+        statusDiv.textContent = '';
+        const fileDongbu = getSelectedFile(fileDongbuInput);
+        const fileMap    = getSelectedFile(fileMapInput);
+
+        if (!fileDongbu || !fileMap) {
+          statusDiv.style.color = 'red';
+          statusDiv.textContent = '두 개의 엑셀 파일을 모두 선택해주세요.';
+          return;
+        }
+
+        try {
+          statusDiv.style.color = 'black';
+          statusDiv.textContent = '파일을 읽고 있습니다... 잠시만 기다려주세요.';
+
+          // 1) 두 파일을 ArrayBuffer로 읽기
+          const [buffDongbu, buffMap] = await Promise.all([
+            readFileAsArrayBuffer(fileDongbu),
+            readFileAsArrayBuffer(fileMap)
+          ]);
+
+          // 2) ArrayBuffer → Workbook
+          const wbDongbu = XLSX.read(buffDongbu, { type: 'array' });
+          const wbMap    = XLSX.read(buffMap,    { type: 'array' });
+
+          // 3) “단순정리본” 시트 JSON 
+          const dongbuData = sheetToJson(wbDongbu, '단순정리본');
+
+          // 4) “차체 지정 RO” 시트 JSON → 작업명 + 행레이블(코드)만 추출
+          const mapDataRaw = sheetToJson(wbMap, '차체 지정 RO');
+          // 정확한 키 이름이 다를 수 있으므로, 콘솔에서 확인 후 필요시 수정
+          const mapData = mapDataRaw.map(r => ({
+            code: String(r['행 레이블'] ?? r['행레이블'] ?? ''),
+            name: String(r['작업명'] ?? '')
+          })).filter(r => r.code !== '');
+
+          statusDiv.textContent = '데이터 필터링 중...';
+
+          // 5) “작업자 팀” == '331' 필터링
+          const filteredDongbu = dongbuData.filter(row => String(row['작업자 팀']) === '331');
+
+          // 6) “유효한 작업코드” 목록 추출
+          const validCodes = mapData.map(r => r.code);
+
+          // 7) “작업코드”가 validCodes에 속하는 행만 남김
+          const finalData = filteredDongbu.filter(row => validCodes.includes(String(row['작업코드'])));
+          if (finalData.length === 0) {
+            throw new Error('필터링 결과 남은 데이터가 없습니다.');
+          }
+
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // “RO분류” 시트 AOA 준비
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          const roColumns = Object.keys(finalData[0]);
+          const aoaRO = [roColumns, ...finalData.map(r => roColumns.map(c => r[c]))];
+
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // “엔지니어 사번” 시트 AOA 준비 (중복 제거)
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          const allEng = finalData.map(r => String(r['주작업자사번']));
+          const uniqueEng = uniqueArray(allEng);
+          const aoaEng = [['주작업자사번'], ...uniqueEng.map(id => [id])];
+
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // “Matrix A(JS)” 시트 AOA 준비 (1행: 작업명, 2행: 작업코드 기준)
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // 1) 매핑 파일 순서대로 “작업명”과 “작업코드” 배열 생성
+          const orderedNames = mapData.map(r => r.name);
+          const orderedCodes = mapData.map(r => r.code);
+
+          // 2) Pivot용 맵 객체 초기화: {주작업자사번: {코드1:0, 코드2:0, ...}, ...}
+          const pivotMap = {};
+          uniqueEng.forEach(id => {
+            pivotMap[id] = {};
+            orderedCodes.forEach(code => {
+              pivotMap[id][code] = 0;
+            });
+          });
+
+          // 3) 실제 카운트 집계 (finalData 순회)
+          finalData.forEach(row => {
+            const engID = String(row['주작업자사번']);
+            const code  = String(row['작업코드']);
+            if (!pivotMap[engID] || !pivotMap[engID].hasOwnProperty(code)) return;
+            pivotMap[engID][code] += 1;
+          });
+
+          // 4) AOA 배열 생성
+          //    - 첫 번째 행: ['', 작업명1, 작업명2, ...]
+          //    - 두 번째 행: ['', 작업코드1, 작업코드2, ...]
+          //    - 세 번째 행부터: [주작업자사번, count(code1), count(code2), ...]
+          const aoaMatrix = [];
+          aoaMatrix.push(['', ...orderedNames]);
+          aoaMatrix.push(['', ...orderedCodes]);
+          uniqueEng.forEach(id => {
+            const rowCounts = orderedCodes.map(code => pivotMap[id][code]);
+            aoaMatrix.push([id, ...rowCounts]);
+          });
+
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // 새 워크북 생성 & 다운로드
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          const newWb = XLSX.utils.book_new();
+
+          // 1) “RO분류” 시트
+          const wsRO = aoaToSheet(aoaRO);
+          XLSX.utils.book_append_sheet(newWb, wsRO, 'RO분류');
+
+          // 2) “엔지니어 사번” 시트
+          const wsEng = aoaToSheet(aoaEng);
+          XLSX.utils.book_append_sheet(newWb, wsEng, '엔지니어 사번');
+
+          // 3) “Matrix A(JS)” 시트
+          const wsMat = aoaToSheet(aoaMatrix);
+          XLSX.utils.book_append_sheet(newWb, wsMat, 'Matrix A(JS)');
+
+          // 다운로드 파일명 예: “20250603_1430_RO분류_결과.xlsx”
+          const now = new Date();
+          const pad = n => n.toString().padStart(2, '0');
+          const fileName = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_`
+                          + `${pad(now.getHours())}${pad(now.getMinutes())}_RO분류_결과.xlsx`;
+
+          downloadWorkbook(newWb, fileName);
+          statusDiv.style.color = 'green';
+          statusDiv.textContent = `가공 완료: 다운로드가 시작됩니다.`;
+
+        } catch (err) {
+          console.error(err);
+          statusDiv.style.color = 'red';
+          statusDiv.textContent = `오류 발생: ${err.message}`;
+        }
+      }
+
+      // 버튼 클릭 시 실행
+      btnProcess.addEventListener('click', processFiles);
+    })();
+    </script>
+</body>
+</html>
