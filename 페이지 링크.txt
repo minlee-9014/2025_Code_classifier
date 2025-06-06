@@ -1,5 +1,5 @@
 
-<기본 페이지>
+<분류 선택 페이지>
 https://minlee-9014.github.io/2025_Code_classifier/
 
 <차체팀(331) 페이지>
